@@ -27,17 +27,19 @@ def save(conn, table, payload):
 
 def load(conn, table, identity):
     row = conn.execute(f'SELECT * FROM {table} WHERE id=?', (identity,)).fetchone()
-    if row is None or hashlib.sha256(row['payload'].encode()).hexdigest() != row['payload_sha256']:
+    if row is None:
+        raise ValueError('echo record missing or damaged')
+    if hashlib.sha256(row['payload'].encode()).hexdigest() != row['payload_sha256']:
         raise ValueError('echo record missing or damaged')
     payload = json.loads(row['payload'])
-    if payload['version'] != 1:
+    if payload.get('version') != 1:
         raise ValueError('unsupported echo record')
     return dict(payload, id=identity)
 
 
 def profile(conn, microphone_id, reference_id, start_ms, end_ms, offset_samples=0):
     if (any(type(v) is not int for v in (start_ms, end_ms, offset_samples))
-            or start_ms < 0 or not 500 <= end_ms-start_ms <= 2000 or abs(offset_samples)>48000):
+            or start_ms < 0 or not 500 <= end_ms-start_ms <= 2000 or abs(offset_samples) > 48000):
         raise ValueError('echo calibration needs 500 to 2000 ms and an offset within one second')
     mic = media_sources.select(conn, original(conn, microphone_id, 2))
     ref = media_sources.select(conn, original(conn, reference_id, 1))
@@ -67,13 +69,26 @@ def create(conn, project_id, profile_ids):
         p = load(conn, 'echo_profiles', identity)
         if clip['asset_id'] != p['microphone']['asset_id'] or clip['fingerprint'] != p['microphone']['fingerprint']:
             raise ValueError('echo profile belongs to another microphone recording')
+        # Paths belong to the original microphone sample clock.  Keep the
+        # frozen source position of this occurrence next to the profile so
+        # every repeated cut reuses the same subtracted waveform before its
+        # own trim and gain; nothing here contains a mutable total.
         length = (clip['end_ms']-clip['start_ms'])*48
-        occurrences.append(dict(clip=clip, profile=p, offset=clock, samples=length))
+        occurrences.append(dict(clip=clip, profile=p, offset=clock, samples=length,
+                                source_start=clip['start_ms']*48, source_stop=clip['end_ms']*48))
         clock += length
     if clock > 1440000:
         raise ValueError('echo programme exceeds thirty seconds')
-    return save(conn, 'echo_plans', dict(version=1, snapshot=snapshot, occurrences=occurrences, samples=clock))
+    return save(conn, 'echo_plans', dict(version=1, snapshot=snapshot, occurrences=occurrences,
+                                         samples=clock, rate=48000))
 
 
 def get(conn, identity):
-    return load(conn, 'echo_plans', identity)
+    plan = load(conn, 'echo_plans', identity)
+    # Plans saved by the previous shape still carry all calibration and edit
+    # decisions; derive only the original source positions they imply so an
+    # already accepted version keeps rendering the same way.
+    for occurrence in plan['occurrences']:
+        occurrence.setdefault('source_start', occurrence['clip']['start_ms']*48)
+        occurrence.setdefault('source_stop', occurrence['clip']['end_ms']*48)
+    return plan
